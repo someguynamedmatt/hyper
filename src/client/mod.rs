@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures::{future, Poll, Async, Future, Stream};
 use futures::unsync::oneshot;
+
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::Handle;
 use tokio_proto::BindClient;
@@ -18,16 +19,12 @@ use tokio_proto::util::client_proxy::ClientProxy;
 pub use tokio_service::Service;
 
 use header::{Headers, Host};
-use http::{self, TokioBody};
-use http::response;
-use http::request;
-use method::Method;
+use proto::{ClientTransaction, Conn, TokioBody};
 use self::pool::{Pool, Pooled};
-use uri::{self, Uri};
+use {Body, Chunk, Method, Uri};
 
-pub use http::response::Response;
-pub use http::request::Request;
 pub use self::connect::{HttpConnector, Connect};
+pub use {Request, Response};
 
 mod connect;
 mod dns;
@@ -35,21 +32,21 @@ mod pool;
 
 /// A Client to make outgoing HTTP requests.
 // If the Connector is clone, then the Client can be clone easily.
-pub struct Client<C, B = http::Body> {
+pub struct Client<C, B = Body> {
     connector: C,
     handle: Handle,
     pool: Pool<TokioClient<B>>,
 }
 
-impl Client<HttpConnector, http::Body> {
+impl Client<HttpConnector, Body> {
     /// Create a new Client with the default config.
     #[inline]
-    pub fn new(handle: &Handle) -> Client<HttpConnector, http::Body> {
+    pub fn new(handle: &Handle) -> Client<HttpConnector, Body> {
         Config::default().build(handle)
     }
 }
 
-impl Client<HttpConnector, http::Body> {
+impl Client<HttpConnector, Body> {
     /// Configure a Client.
     ///
     /// # Example
@@ -68,7 +65,7 @@ impl Client<HttpConnector, http::Body> {
     /// # }
     /// ```
     #[inline]
-    pub fn configure() -> Config<UseDefaultConnector, http::Body> {
+    pub fn configure() -> Config<UseDefaultConnector, Body> {
         Config::default()
     }
 }
@@ -220,7 +217,7 @@ impl<C, B> fmt::Debug for Client<C, B> {
     }
 }
 
-type TokioClient<B> = ClientProxy<Message<http::RequestHead, B>, Message<http::ResponseHead, TokioBody>, ::Error>;
+type TokioClient<B> = ClientProxy<Message<::http::request::Parts, B>, Message<::http::response::Parts, TokioBody>, ::Error>;
 
 struct HttpClient<B> {
     client_rx: RefCell<Option<oneshot::Receiver<Pooled<TokioClient<B>>>>>,
@@ -231,12 +228,12 @@ where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error> + 'static,
       B::Item: AsRef<[u8]>,
 {
-    type Request = http::RequestHead;
+    type Request = ::http::request::Parts;
     type RequestBody = B::Item;
-    type Response = http::ResponseHead;
-    type ResponseBody = http::Chunk;
+    type Response = ::http::response::Parts;
+    type ResponseBody = Chunk;
     type Error = ::Error;
-    type Transport = http::Conn<T, B::Item, http::ClientTransaction, Pooled<TokioClient<B>>>;
+    type Transport = Conn<T, B::Item, ClientTransaction, Pooled<TokioClient<B>>>;
     type BindTransport = BindingClient<T, B>;
 
     fn bind_transport(&self, io: T) -> Self::BindTransport {
@@ -257,13 +254,13 @@ where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error>,
       B::Item: AsRef<[u8]>,
 {
-    type Item = http::Conn<T, B::Item, http::ClientTransaction, Pooled<TokioClient<B>>>;
+    type Item = Conn<T, B::Item, ClientTransaction, Pooled<TokioClient<B>>>;
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.rx.poll() {
             Ok(Async::Ready(client)) => Ok(Async::Ready(
-                    http::Conn::new(self.io.take().expect("binding client io lost"), client)
+                    Conn::new(self.io.take().expect("binding client io lost"), client)
             )),
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Err(_canceled) => unreachable!(),
@@ -286,10 +283,10 @@ pub struct Config<C, B> {
 #[derive(Debug, Clone, Copy)]
 pub struct UseDefaultConnector(());
 
-impl Default for Config<UseDefaultConnector, http::Body> {
-    fn default() -> Config<UseDefaultConnector, http::Body> {
+impl Default for Config<UseDefaultConnector, Body> {
+    fn default() -> Config<UseDefaultConnector, Body> {
         Config {
-            _body_type: PhantomData::<http::Body>,
+            _body_type: PhantomData::<Body>,
             //connect_timeout: Duration::from_secs(10),
             connector: UseDefaultConnector(()),
             keep_alive: true,

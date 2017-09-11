@@ -3,11 +3,11 @@ use std::fmt;
 use std::io::{self, Write};
 use std::ptr;
 
+use bytes::{BytesMut, Bytes};
 use futures::{Async, Poll};
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use http::{Http1Transaction, MessageHead};
-use bytes::{BytesMut, Bytes};
+use super::{Http1Transaction};
 
 const INIT_BUFFER_SIZE: usize = 8192;
 pub const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
@@ -61,7 +61,7 @@ impl<T: AsyncRead + AsyncWrite> Buffered<T> {
         }
     }
 
-    pub fn parse<S: Http1Transaction>(&mut self) -> Poll<MessageHead<S::Incoming>, ::Error> {
+    pub fn parse<S: Http1Transaction>(&mut self) -> Poll<S::Incoming, ::Error> {
         loop {
             match try!(S::parse(&mut self.read_buf)) {
                 Some(head) => {
@@ -371,6 +371,6 @@ fn test_parse_reads_until_blocked() {
 
     let mock = AsyncIo::new(MockBuf::wrap(raw.into()), raw.len());
     let mut buffered = Buffered::new(mock);
-    assert_eq!(buffered.parse::<super::ClientTransaction>().unwrap(), Async::NotReady);
+    assert!(buffered.parse::<super::ClientTransaction>().unwrap().is_not_ready());
     assert!(buffered.io.blocked());
 }

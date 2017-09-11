@@ -11,6 +11,8 @@ use std::net::SocketAddr;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
+use http;
+
 use futures::future;
 use futures::task::{self, Task};
 use futures::{Future, Stream, Poll, Async, Sink, StartSend, AsyncSink};
@@ -22,14 +24,16 @@ use tokio::net::TcpListener;
 use tokio_proto::BindServer;
 use tokio_proto::streaming::Message;
 use tokio_proto::streaming::pipeline::{Transport, Frame, ServerProto};
+
+use proto::{Conn, KA, ServerTransaction, TokioBody};
+use {Body, Chunk};
+
 pub use tokio_service::{NewService, Service};
 
-use http;
-use http::response;
-use http::request;
-
-pub use http::response::Response;
-pub use http::request::Request;
+/// dox
+pub type Request = ::Request<Option<Body>>;
+/// dox
+pub type Response<B> = ::Response<Option<B>>;
 
 /// An instance of the HTTP protocol, and implementation of tokio-proto's
 /// `ServerProto` trait.
@@ -128,7 +132,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
     {
         self.bind_server(handle, io, HttpService {
             inner: service,
-            remote_addr: remote_addr,
+            _remote_addr: remote_addr,
         })
     }
 }
@@ -151,17 +155,17 @@ impl<B> fmt::Debug for Http<B> {
 
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
-pub struct __ProtoRequest(http::RequestHead);
+pub struct __ProtoRequest(http::request::Parts);
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
-pub struct __ProtoResponse(ResponseHead);
+pub struct __ProtoResponse(http::response::Parts);
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
-pub struct __ProtoTransport<T, B>(http::Conn<T, B, http::ServerTransaction>);
+pub struct __ProtoTransport<T, B>(Conn<T, B, ServerTransaction>);
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
 pub struct __ProtoBindTransport<T, B> {
-    inner: future::FutureResult<http::Conn<T, B, http::ServerTransaction>, io::Error>,
+    inner: future::FutureResult<Conn<T, B, ServerTransaction>, io::Error>,
 }
 
 impl<T, B> ServerProto<T> for Http<B>
@@ -169,7 +173,7 @@ impl<T, B> ServerProto<T> for Http<B>
           B: AsRef<[u8]> + 'static,
 {
     type Request = __ProtoRequest;
-    type RequestBody = http::Chunk;
+    type RequestBody = Chunk;
     type Response = __ProtoResponse;
     type ResponseBody = B;
     type Error = ::Error;
@@ -179,12 +183,12 @@ impl<T, B> ServerProto<T> for Http<B>
     #[inline]
     fn bind_transport(&self, io: T) -> Self::BindTransport {
         let ka = if self.keep_alive {
-            http::KA::Busy
+            KA::Busy
         } else {
-            http::KA::Disabled
+            KA::Disabled
         };
         __ProtoBindTransport {
-            inner: future::ok(http::Conn::new(io, ka)),
+            inner: future::ok(Conn::new(io, ka)),
         }
     }
 }
@@ -238,7 +242,7 @@ impl<T, B> Stream for __ProtoTransport<T, B>
     where T: AsyncRead + AsyncWrite + 'static,
           B: AsRef<[u8]> + 'static,
 {
-    type Item = Frame<__ProtoRequest, http::Chunk, ::Error>;
+    type Item = Frame<__ProtoRequest, Chunk, ::Error>;
     type Error = io::Error;
 
     #[inline]
@@ -285,21 +289,22 @@ impl<T, B> Future for __ProtoBindTransport<T, B>
     }
 }
 
-impl From<Message<__ProtoRequest, http::TokioBody>> for Request {
+/*
+impl From<Message<__ProtoRequest, TokioBody>> for Request {
     #[inline]
-    fn from(message: Message<__ProtoRequest, http::TokioBody>) -> Request {
+    fn from(message: Message<__ProtoRequest, TokioBody>) -> Request {
         let (head, body) = match message {
-            Message::WithoutBody(head) => (head.0, http::Body::empty()),
+            Message::WithoutBody(head) => (head.0, Body::empty()),
             Message::WithBody(head, body) => (head.0, body.into()),
         };
-        request::from_wire(None, head, body)
+        Request::from_parts(head, body)
     }
 }
 
 impl<B> Into<Message<__ProtoResponse, B>> for Response<B> {
     #[inline]
     fn into(self) -> Message<__ProtoResponse, B> {
-        let (head, body) = response::split(self);
+        let (head, body) = self.into_parts();
         if let Some(body) = body {
             Message::WithBody(__ProtoResponse(head), body.into())
         } else {
@@ -307,20 +312,19 @@ impl<B> Into<Message<__ProtoResponse, B>> for Response<B> {
         }
     }
 }
+*/
 
 struct HttpService<T> {
     inner: T,
-    remote_addr: SocketAddr,
+    _remote_addr: SocketAddr,
 }
-
-type ResponseHead = http::MessageHead<::StatusCode>;
 
 impl<T, B> Service for HttpService<T>
     where T: Service<Request=Request, Response=Response<B>, Error=::Error>,
           B: Stream<Error=::Error>,
           B::Item: AsRef<[u8]>,
 {
-    type Request = Message<__ProtoRequest, http::TokioBody>;
+    type Request = Message<__ProtoRequest, TokioBody>;
     type Response = Message<__ProtoResponse, B>;
     type Error = ::Error;
     type Future = Map<T::Future, fn(Response<B>) -> Message<__ProtoResponse, B>>;
@@ -328,11 +332,18 @@ impl<T, B> Service for HttpService<T>
     #[inline]
     fn call(&self, message: Self::Request) -> Self::Future {
         let (head, body) = match message {
-            Message::WithoutBody(head) => (head.0, http::Body::empty()),
-            Message::WithBody(head, body) => (head.0, body.into()),
+            Message::WithoutBody(head) => (head.0, None),
+            Message::WithBody(head, body) => (head.0, Some(body.into())),
         };
-        let req = request::from_wire(Some(self.remote_addr), head, body);
-        self.inner.call(req).map(Into::into)
+        let req = Request::from_parts(head, body);
+        self.inner.call(req).map(|res| {
+            let (head, body) = res.into_parts();
+            if let Some(body) = body.into() {
+                Message::WithBody(__ProtoResponse(head), body)
+            } else {
+                Message::WithoutBody(__ProtoResponse(head))
+            }
+        })
     }
 }
 

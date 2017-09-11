@@ -1,4 +1,5 @@
 #![deny(warnings)]
+extern crate http;
 extern crate hyper;
 extern crate futures;
 extern crate spmc;
@@ -7,6 +8,8 @@ extern crate pretty_env_logger;
 use futures::{Future, Stream};
 use futures::sync::oneshot;
 
+use http::{Request, Response};
+
 use std::net::{TcpStream, SocketAddr};
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -14,11 +17,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hyper::server::{Http, Request, Response, Service, NewService};
+use hyper::Body;
+use hyper::server::{Http, Service, NewService};
+
+type Res = Response<Option<Body>>;
 
 #[test]
 fn get_should_ignore_body() {
     let server = serve();
+    server.reply(Response::default());
 
     let mut req = connect(server.addr());
     // Connection: close = don't try to parse the body as a new request
@@ -37,6 +44,7 @@ fn get_should_ignore_body() {
 #[test]
 fn get_with_body() {
     let server = serve();
+    server.reply(Response::default());
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -55,10 +63,12 @@ fn get_with_body() {
 fn get_fixed_response() {
     let foo_bar = b"foo bar baz";
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(foo_bar.len() as u64))
-        .body(foo_bar);
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*foo_bar.len().to_string())
+        .body(Some(Body::from(&foo_bar[..])))
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -75,12 +85,14 @@ fn get_fixed_response() {
 
 #[test]
 fn get_chunked_response() {
-    let foo_bar = b"foo bar baz";
+    let foo_bar = "foo bar baz";
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::TransferEncoding::chunked())
-        .body(foo_bar);
+    let res = Response::builder()
+        .status(200)
+        .header("Transfer-Encoding", "chunked")
+        .body(Some(Body::from(foo_bar)))
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -100,10 +112,12 @@ fn get_chunked_response_with_ka() {
     let foo_bar = b"foo bar baz";
     let foo_bar_chunk = b"\r\nfoo bar baz\r\n0\r\n\r\n";
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::TransferEncoding::chunked())
-        .body(foo_bar);
+    let res = Response::builder()
+        .status(200)
+        .header("Transfer-Encoding", "chunked")
+        .body(Some(Body::from(&foo_bar[..])))
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -127,10 +141,12 @@ fn get_chunked_response_with_ka() {
     // try again!
 
     let quux = b"zar quux";
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(quux.len() as u64))
-        .body(quux);
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*quux.len().to_string())
+        .body(Some(Body::from(&quux[..])))
+        .unwrap();
+    server.reply(res);
     req.write_all(b"\
         GET /quux HTTP/1.1\r\n\
         Host: example.domain\r\n\
@@ -154,6 +170,9 @@ fn get_chunked_response_with_ka() {
 fn post_with_chunked_body() {
     let server = serve();
     let mut req = connect(server.addr());
+    let res = Response::default();
+    server.reply(res);
+
     req.write_all(b"\
         POST / HTTP/1.1\r\n\
         Host: example.domain\r\n\
@@ -177,9 +196,11 @@ fn post_with_chunked_body() {
 fn empty_response_chunked() {
     let server = serve();
 
-    server.reply()
-        .status(hyper::Ok)
-        .body("");
+    let res = Response::builder()
+        .status(200)
+        .body(Some(Body::from("")))
+        .unwrap();
+    server.reply(res);
 
     let mut req = connect(server.addr());
     req.write_all(b"\
@@ -212,9 +233,12 @@ fn empty_response_chunked_without_body_should_set_content_length() {
     extern crate pretty_env_logger;
     let _ = pretty_env_logger::init();
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::TransferEncoding::chunked());
+    let res = Response::builder()
+        .status(200)
+        .header("Transfer-Encoding", "gzip, chunked")
+        .body(None)
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -242,9 +266,12 @@ fn head_response_can_send_content_length() {
     extern crate pretty_env_logger;
     let _ = pretty_env_logger::init();
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(1024));
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", "1024")
+        .body(None)
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         HEAD / HTTP/1.1\r\n\
@@ -271,9 +298,12 @@ fn response_does_not_set_chunked_if_body_not_allowed() {
     extern crate pretty_env_logger;
     let _ = pretty_env_logger::init();
     let server = serve();
-    server.reply()
-        .status(hyper::StatusCode::NotModified)
-        .header(hyper::header::TransferEncoding::chunked());
+    let res = Response::builder()
+        .status(304)
+        .header("Transfer-Encoding", "chunked")
+        .body(None)
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -300,10 +330,12 @@ fn response_does_not_set_chunked_if_body_not_allowed() {
 fn keep_alive() {
     let foo_bar = b"foo bar baz";
     let server = serve();
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(foo_bar.len() as u64))
-        .body(foo_bar);
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*foo_bar.len().to_string())
+        .body(Some(Body::from(&foo_bar[..])))
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -326,10 +358,12 @@ fn keep_alive() {
     // try again!
 
     let quux = b"zar quux";
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(quux.len() as u64))
-        .body(quux);
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*quux.len().to_string())
+        .body(Some(Body::from(&quux[..])))
+        .unwrap();
+    server.reply(res);
     req.write_all(b"\
         GET /quux HTTP/1.1\r\n\
         Host: example.domain\r\n\
@@ -356,10 +390,12 @@ fn disable_keep_alive() {
         keep_alive_disabled: true,
         .. Default::default()
     });
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(foo_bar.len() as u64))
-        .body(foo_bar);
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*foo_bar.len().to_string())
+        .body(Some(Body::from(&foo_bar[..])))
+        .unwrap();
+    server.reply(res);
     let mut req = connect(server.addr());
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -382,11 +418,13 @@ fn disable_keep_alive() {
     // try again!
 
     let quux = b"zar quux";
-    server.reply()
-        .status(hyper::Ok)
-        .header(hyper::header::ContentLength(quux.len() as u64))
-        .body(quux);
-
+    let res = Response::builder()
+        .status(200)
+        .header("Content-Length", &*quux.len().to_string())
+        .body(Some(Body::from(&quux[..])))
+        .unwrap();
+    server.reply(res);
+ 
     let _ = req.write_all(b"\
         GET /quux HTTP/1.1\r\n\
         Host: example.domain\r\n\
@@ -411,7 +449,7 @@ fn disable_keep_alive() {
 fn expect_continue() {
     let server = serve();
     let mut req = connect(server.addr());
-    server.reply().status(hyper::Ok);
+    server.reply(Response::default());
 
     req.write_all(b"\
         POST /foo HTTP/1.1\r\n\
@@ -444,7 +482,7 @@ fn expect_continue() {
 struct Serve {
     addr: SocketAddr,
     msg_rx: mpsc::Receiver<Msg>,
-    reply_tx: spmc::Sender<Reply>,
+    reply_tx: spmc::Sender<Res>,
     shutdown_signal: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -462,32 +500,8 @@ impl Serve {
         buf
     }
 
-    fn reply(&self) -> ReplyBuilder {
-        ReplyBuilder {
-            tx: &self.reply_tx
-        }
-    }
-}
-
-struct ReplyBuilder<'a> {
-    tx: &'a spmc::Sender<Reply>,
-}
-
-impl<'a> ReplyBuilder<'a> {
-    fn status(self, status: hyper::StatusCode) -> Self {
-        self.tx.send(Reply::Status(status)).unwrap();
-        self
-    }
-
-    fn header<H: hyper::header::Header>(self, header: H) -> Self {
-        let mut headers = hyper::Headers::new();
-        headers.set(header);
-        self.tx.send(Reply::Headers(headers)).unwrap();
-        self
-    }
-
-    fn body<T: AsRef<[u8]>>(self, body: T) {
-        self.tx.send(Reply::Body(body.as_ref().into())).unwrap();
+    fn reply(&self, res: Res) {
+        self.reply_tx.send(res).unwrap();
     }
 }
 
@@ -501,25 +515,17 @@ impl Drop for Serve {
 #[derive(Clone)]
 struct TestService {
     tx: Arc<Mutex<mpsc::Sender<Msg>>>,
-    reply: spmc::Receiver<Reply>,
+    reply: spmc::Receiver<Res>,
     _timeout: Option<Duration>,
 }
 
-#[derive(Clone, Debug)]
-enum Reply {
-    Status(hyper::StatusCode),
-    Headers(hyper::Headers),
-    Body(Vec<u8>),
-}
-
 enum Msg {
-    //Head(Request),
     Chunk(Vec<u8>),
 }
 
 impl NewService for TestService {
-    type Request = Request;
-    type Response = Response;
+    type Request = Request<Option<Body>>;
+    type Response = Res;
     type Error = hyper::Error;
 
     type Instance = TestService;
@@ -527,37 +533,21 @@ impl NewService for TestService {
     fn new_service(&self) -> std::io::Result<TestService> {
         Ok(self.clone())
     }
-
-
 }
 
 impl Service for TestService {
-    type Request = Request;
-    type Response = Response;
+    type Request = Request<Option<Body>>;
+    type Response = Res;
     type Error = hyper::Error;
-    type Future = Box<Future<Item=Response, Error=hyper::Error>>;
-    fn call(&self, req: Request) -> Self::Future {
+    type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
+    fn call(&self, req: Self::Request) -> Self::Future {
         let tx = self.tx.clone();
         let replies = self.reply.clone();
-        Box::new(req.body().for_each(move |chunk| {
+        Box::new(req.into_parts().1.unwrap_or_default().for_each(move |chunk| {
             tx.lock().unwrap().send(Msg::Chunk(chunk.to_vec())).unwrap();
             Ok(())
         }).map(move |_| {
-            let mut res = Response::new();
-            while let Ok(reply) = replies.try_recv() {
-                match reply {
-                    Reply::Status(s) => {
-                        res.set_status(s);
-                    },
-                    Reply::Headers(headers) => {
-                        *res.headers_mut() = headers;
-                    },
-                    Reply::Body(body) => {
-                        res.set_body(body);
-                    },
-                }
-            }
-            res
+            replies.try_recv().unwrap()
         }))
     }
 
@@ -593,7 +583,7 @@ fn serve_with_options(options: ServeOptions) -> Serve {
     let keep_alive = !options.keep_alive_disabled;
     let dur = options.timeout;
 
-    let thread_name = format!("test-server-{:?}", dur);
+    let thread_name = format!("test-server");
     let thread = thread::Builder::new().name(thread_name).spawn(move || {
         let srv = Http::new().keep_alive(keep_alive).bind(&addr, TestService {
             tx: Arc::new(Mutex::new(msg_tx.clone())),
@@ -614,5 +604,4 @@ fn serve_with_options(options: ServeOptions) -> Serve {
         thread: Some(thread),
     }
 }
-
 

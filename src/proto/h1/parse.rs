@@ -1,25 +1,27 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 
-use httparse;
 use bytes::{BytesMut, Bytes};
+use http::header::{GetAll, HeaderMap, HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, DATE, TRANSFER_ENCODING};
 
-use header::{self, Headers, ContentLength, TransferEncoding};
-use http::{MessageHead, RawStatus, Http1Transaction, ParseResult,
-           ServerTransaction, ClientTransaction, RequestLine, RequestHead};
-use http::h1::{Encoder, Decoder, date};
-use method::Method;
-use status::StatusCode;
-use version::HttpVersion::{Http10, Http11};
+use http::version::{HTTP_10, HTTP_11};
+use httparse;
+
+//use header::{self, Headers, ContentLength, TransferEncoding};
+use proto::{Http1Transaction, ParseResult, ServerTransaction, ClientTransaction};
+use super::{Encoder, Decoder, date};
+
+use {Method, StatusCode, Uri, Version};
 
 const MAX_HEADERS: usize = 100;
 const AVERAGE_HEADER_SIZE: usize = 30; // totally scientific
 
 impl Http1Transaction for ServerTransaction {
-    type Incoming = RequestLine;
-    type Outgoing = StatusCode;
+    type Incoming = ::http::request::Parts;
+    type Outgoing = ::http::response::Parts;
 
-    fn parse(buf: &mut BytesMut) -> ParseResult<RequestLine> {
+    fn parse(buf: &mut BytesMut) -> ParseResult<Self::Incoming> {
         if buf.len() == 0 {
             return Ok(None);
         }
@@ -33,14 +35,14 @@ impl Http1Transaction for ServerTransaction {
             let mut req = httparse::Request::new(&mut headers);
             match try!(req.parse(&buf)) {
                 httparse::Status::Complete(len) => {
-                    trace!("Request.parse Complete({})", len);
-                    let method = try!(req.method.unwrap().parse());
+                    trace!("httparse Complete({})", len);
+                    let method = Method::from_bytes(req.method.unwrap().as_bytes())?;
                     let path = req.path.unwrap();
                     let bytes_ptr = buf.as_ref().as_ptr() as usize;
                     let path_start = path.as_ptr() as usize - bytes_ptr;
                     let path_end = path_start + path.len();
                     let path = (path_start, path_end);
-                    let version = if req.version.unwrap() == 1 { Http11 } else { Http10 };
+                    let version = if req.version.unwrap() == 1 { HTTP_11 } else { HTTP_10 };
 
                     record_header_indices(buf.as_ref(), &req.headers, &mut headers_indices);
                     let headers_len = req.headers.len();
@@ -50,32 +52,27 @@ impl Http1Transaction for ServerTransaction {
             }
         };
 
-        let mut headers = Headers::with_capacity(headers_len);
+        let mut headers = HeaderMap::with_capacity(headers_len);
         let slice = buf.split_to(len).freeze();
         let path = slice.slice(path.0, path.1);
-        // path was found to be utf8 by httparse
-        let path = try!(unsafe { ::uri::from_utf8_unchecked(path) });
-        let subject = RequestLine(
-            method,
-            path,
-        );
+        let uri = Uri::from_shared(path)?;
 
         headers.extend(HeadersAsBytesIter {
             headers: headers_indices[..headers_len].iter(),
             slice: slice,
         });
 
-        Ok(Some((MessageHead {
-            version: version,
-            subject: subject,
-            headers: headers,
-        }, len)))
+        let mut head = ::http::Request::new(()).into_parts().0;
+        head.method = method;
+        head.uri = uri;
+        head.version = version;
+        head.headers = headers;
+
+        Ok(Some((head, len)))
     }
 
-    fn decoder(head: &MessageHead<Self::Incoming>, method: &mut Option<Method>) -> ::Result<Decoder> {
-        use ::header;
-
-        *method = Some(head.subject.0.clone());
+    fn decoder(head: &Self::Incoming, method: &mut Option<Method>) -> ::Result<Decoder> {
+        *method = Some(head.method.clone());
 
         // According to https://tools.ietf.org/html/rfc7230#section-3.3.3
         // 1. (irrelevant to Request)
@@ -86,44 +83,64 @@ impl Http1Transaction for ServerTransaction {
         // 6. Length 0.
         // 7. (irrelevant to Request)
 
-        if let Some(&header::TransferEncoding(ref encodings)) = head.headers.get() {
+        if let Some(values) = head.headers.get_all(&TRANSFER_ENCODING) {
             // https://tools.ietf.org/html/rfc7230#section-3.3.3
             // If Transfer-Encoding header is present, and 'chunked' is
             // not the final encoding, and this is a Request, then it is
-            // mal-formed. A server should responsed with 400 Bad Request.
-            if encodings.last() == Some(&header::Encoding::Chunked) {
+            // mal-formed. A server should respond with 400 Bad Request.
+            let last = values.iter()
+                .next_back()
+                .expect("get_all always has at least 1 item");
+            if find_chunked(last) {
                 Ok(Decoder::chunked())
             } else {
                 debug!("request with transfer-encoding header, but not chunked, bad request");
                 Err(::Error::Header)
             }
-        } else if let Some(&header::ContentLength(len)) = head.headers.get() {
-            Ok(Decoder::length(len))
-        } else if head.headers.has::<header::ContentLength>() {
-            debug!("illegal Content-Length: {:?}", head.headers.get_raw("Content-Length"));
-            Err(::Error::Header)
+        } else if let Some(values) = head.headers.get_all(&CONTENT_LENGTH) {
+            match parse_content_length(values) {
+                Ok(len) => {
+                    Ok(Decoder::length(len))
+                }
+                Err(_) => {
+                    //debug!("illegal Content-Length: {:?}", head.headers.get_raw("Content-Length"));
+                    Err(::Error::Header)
+                }
+            }
         } else {
             Ok(Decoder::length(0))
         }
     }
 
-
-    fn encode(mut head: MessageHead<Self::Outgoing>, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> Encoder {
+    fn encode(mut head: Self::Outgoing, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> Encoder {
         trace!("ServerTransaction::encode has_body={}, method={:?}", has_body, method);
 
-        let body = ServerTransaction::set_length(&mut head, has_body, method.as_ref());
+        let body = ServerTransaction::set_length(
+            &mut head,
+            has_body,
+            method.as_ref().expect("server response lost request method")
+        );
 
         let init_cap = 30 + head.headers.len() * AVERAGE_HEADER_SIZE;
         dst.reserve(init_cap);
-        if head.version == ::HttpVersion::Http11 && head.subject == ::StatusCode::Ok {
+        if head.version == HTTP_11 && head.status == ::http::status::OK {
+            // optimize common response
             extend(dst, b"HTTP/1.1 200 OK\r\n");
-            let _ = write!(FastWrite(dst), "{}", head.headers);
         } else {
-            let _ = write!(FastWrite(dst), "{} {}\r\n{}", head.version, head.subject, head.headers);
+            if head.version == HTTP_11 {
+                extend(dst, b"HTTP/1.1 ");
+            } else if head.version == HTTP_10 {
+                extend(dst, b"HTTP/1.1 ");
+            } else {
+                panic!("unexpected version {:?}", head.version);
+            }
+            let _ = write!(FastWrite(dst), "{}", head.status);
+            extend(dst, b"\r\n");
         }
+        write_headers(dst, &head.headers);
         // using http::h1::date is quite a lot faster than generating a unique Date header each time
         // like req/s goes up about 10%
-        if !head.headers.has::<header::Date>() {
+        if !head.headers.contains_key(&DATE) {
             dst.reserve(date::DATE_VALUE_LENGTH + 8);
             extend(dst, b"Date: ");
             date::extend(dst);
@@ -135,34 +152,32 @@ impl Http1Transaction for ServerTransaction {
 }
 
 impl ServerTransaction {
-    fn set_length(head: &mut MessageHead<StatusCode>, has_body: bool, method: Option<&Method>) -> Encoder {
-        // these are here thanks to borrowck
-        // `if method == Some(&Method::Get)` says the RHS doesnt live long enough
-        const HEAD: Option<&'static Method> = Some(&Method::Head);
-        const CONNECT: Option<&'static Method> = Some(&Method::Connect);
+    fn set_length(head: &mut ::http::response::Parts, has_body: bool, method: &Method) -> Encoder {
+        use http::method::{CONNECT, HEAD};
+        use http::status;
 
         let can_have_body = {
-            if method == HEAD {
+            if method == &HEAD {
                 false
-            } else if method == CONNECT && head.subject.is_success() {
+            } else if method == &CONNECT && head.status.is_success() {
                 false
             } else {
-                match head.subject {
+                match head.status {
                     // TODO: support for 1xx codes needs improvement everywhere
                     // would be 100...199 => false
-                    StatusCode::NoContent |
-                    StatusCode::NotModified => false,
+                    status::NO_CONTENT |
+                    status::NOT_MODIFIED => false,
                     _ => true,
                 }
             }
         };
 
         if has_body && can_have_body {
-            set_length(&mut head.headers)
+            encode_length_or_chunked(&mut head.headers)
         } else {
-            head.headers.remove::<TransferEncoding>();
+            head.headers.remove(&TRANSFER_ENCODING);
             if can_have_body {
-                head.headers.set(ContentLength(0));
+                head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
             }
             Encoder::length(0)
         }
@@ -170,10 +185,10 @@ impl ServerTransaction {
 }
 
 impl Http1Transaction for ClientTransaction {
-    type Incoming = RawStatus;
-    type Outgoing = RequestLine;
+    type Incoming = ::http::response::Parts;
+    type Outgoing = ::http::request::Parts;
 
-    fn parse(buf: &mut BytesMut) -> ParseResult<RawStatus> {
+    fn parse(buf: &mut BytesMut) -> ParseResult<Self::Incoming> {
         if buf.len() == 0 {
             return Ok(None);
         }
@@ -190,12 +205,12 @@ impl Http1Transaction for ClientTransaction {
                 httparse::Status::Complete(len) => {
                     trace!("Response.parse Complete({})", len);
                     let code = res.code.unwrap();
-                    let status = try!(StatusCode::try_from(code).map_err(|_| ::Error::Status));
+                    let status = StatusCode::from_u16(code)?;
                     let reason = match status.canonical_reason() {
                         Some(reason) if reason == res.reason.unwrap() => Cow::Borrowed(reason),
                         _ => Cow::Owned(res.reason.unwrap().to_owned())
                     };
-                    let version = if res.version.unwrap() == 1 { Http11 } else { Http10 };
+                    let version = if res.version.unwrap() == 1 { HTTP_11 } else { HTTP_10 };
                     record_header_indices(bytes, &res.headers, &mut headers_indices);
                     let headers_len = res.headers.len();
                     (len, code, reason, version, headers_len)
@@ -204,20 +219,22 @@ impl Http1Transaction for ClientTransaction {
             }
         };
 
-        let mut headers = Headers::with_capacity(headers_len);
+        let mut headers = HeaderMap::with_capacity(headers_len);
         let slice = buf.split_to(len).freeze();
         headers.extend(HeadersAsBytesIter {
             headers: headers_indices[..headers_len].iter(),
             slice: slice,
         });
-        Ok(Some((MessageHead {
-            version: version,
-            subject: RawStatus(code, reason),
-            headers: headers,
-        }, len)))
+        let mut head = ::http::Response::new(()).into_parts().0;
+        head.status = StatusCode::from_u16(code)?;
+        head.version = version;
+        head.headers = headers;
+        Ok(Some((head, len)))
     }
 
-    fn decoder(inc: &MessageHead<Self::Incoming>, method: &mut Option<Method>) -> ::Result<Decoder> {
+    fn decoder(inc: &Self::Incoming, method: &mut Option<Method>) -> ::Result<Decoder> {
+        use http::method::{CONNECT, HEAD};
+
         // According to https://tools.ietf.org/html/rfc7230#section-3.3.3
         // 1. HEAD responses, and Status 1xx, 204, and 304 cannot have a body.
         // 2. Status 2xx to a CONNECT cannot have a body.
@@ -228,10 +245,10 @@ impl Http1Transaction for ClientTransaction {
         // 7. Read till EOF.
 
         match *method {
-            Some(Method::Head) => {
+            Some(HEAD) => {
                 return Ok(Decoder::length(0));
             }
-            Some(Method::Connect) => match inc.subject.0 {
+            Some(CONNECT) => match inc.status.as_u16() {
                 200...299 => {
                     return Ok(Decoder::length(0));
                 },
@@ -243,13 +260,15 @@ impl Http1Transaction for ClientTransaction {
             }
         }
 
-        match inc.subject.0 {
+        match inc.status.as_u16() {
             100...199 |
             204 |
             304 => return Ok(Decoder::length(0)),
             _ => (),
         }
 
+        unimplemented!("decoder");
+        /*
         if let Some(&header::TransferEncoding(ref codings)) = inc.headers.get() {
             if codings.last() == Some(&header::Encoding::Chunked) {
                 Ok(Decoder::chunked())
@@ -266,57 +285,122 @@ impl Http1Transaction for ClientTransaction {
             trace!("neither Transfer-Encoding nor Content-Length");
             Ok(Decoder::eof())
         }
+        */
     }
 
-    fn encode(mut head: MessageHead<Self::Outgoing>, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> Encoder {
-        trace!("ClientTransaction::encode has_body={}, method={:?}", has_body, method);
-
-        *method = Some(head.subject.0.clone());
+    fn encode(mut head: Self::Outgoing, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> Encoder {
+        *method = Some(head.method.clone());
 
         let body = ClientTransaction::set_length(&mut head, has_body);
 
         let init_cap = 30 + head.headers.len() * AVERAGE_HEADER_SIZE;
         dst.reserve(init_cap);
-        let _ = write!(FastWrite(dst), "{} {}\r\n{}\r\n", head.subject, head.version, head.headers);
+
+        dst.extend(head.method.as_str().as_bytes());
+        dst.push(b' ');
+
+        let _ = write!(FastWrite(dst), "{}", head.uri);
+        dst.push(b' ');
+
+        dst.extend(b"HTTP/1.1\r\n");
+
+        write_headers(dst, &head.headers);
+        dst.extend(b"\r\n");
 
         body
     }
 }
 
 impl ClientTransaction {
-    fn set_length(head: &mut RequestHead, has_body: bool) -> Encoder {
+    fn set_length(head: &mut ::http::request::Parts, has_body: bool) -> Encoder {
         if has_body {
-            set_length(&mut head.headers)
+            encode_length_or_chunked(&mut head.headers)
         } else {
-            head.headers.remove::<ContentLength>();
-            head.headers.remove::<TransferEncoding>();
+            head.headers.remove(&CONTENT_LENGTH);
+            head.headers.remove(&TRANSFER_ENCODING);
             Encoder::length(0)
         }
     }
 }
 
-fn set_length(headers: &mut Headers) -> Encoder {
-    let len = headers.get::<header::ContentLength>().map(|n| **n);
+fn write_headers(dst: &mut Vec<u8>, headers: &HeaderMap<HeaderValue>) {
+    for (name, value) in headers {
+        extend(dst, name.as_str().as_bytes());
+        extend(dst, b": ");
+        extend(dst, value.as_bytes());
+        extend(dst, b"\r\n");
+    }
+}
+
+fn encode_length_or_chunked(headers: &mut HeaderMap<HeaderValue>) -> Encoder {
+    let len = headers.get(&CONTENT_LENGTH).and_then(|value| {
+        value.to_str().ok().and_then(|s| {
+            s.parse().ok()
+        })
+    });
 
     if let Some(len) = len {
+        headers.remove(&TRANSFER_ENCODING);
         Encoder::length(len)
     } else {
-        let encodings = match headers.get_mut::<header::TransferEncoding>() {
-            Some(&mut header::TransferEncoding(ref mut encodings)) => {
-                if encodings.last() != Some(&header::Encoding::Chunked) {
-                    encodings.push(header::Encoding::Chunked);
-                }
-                false
-            },
-            None => true
-        };
+        use ::http::header::Entry;
+        match headers.entry(TRANSFER_ENCODING).expect("constant is valid") {
+            Entry::Occupied(mut entry) => {
+                let last = entry.iter_mut()
+                    .next_back()
+                    .expect("occupied entry always has at least 1 value");
 
-        if encodings {
-            headers.set(header::TransferEncoding(vec![header::Encoding::Chunked]));
+                let has_chunked = find_chunked(last);
+                if !has_chunked {
+                    let mut new = BytesMut::from(last.as_bytes());
+                    new.extend(b", chunked");
+                    // TODO: use HeaderValue::from_shared_unchecked
+                    *last = HeaderValue::from_shared(new.freeze())
+                        .expect("all pushed bytes are valid");
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(HeaderValue::from_static("chunked"));
+            }
         }
+
         Encoder::chunked()
     }
 }
+
+fn parse_content_length<'a>(values: GetAll<'a, HeaderValue>) -> Result<u64, InvalidContentLength> {
+    let parse = |val: &HeaderValue| {
+        let s = val.to_str().map_err(|_| InvalidContentLength)?;
+        s.parse().map_err(|_| InvalidContentLength)
+    };
+    let mut prev = None;
+    for value in values {
+        let len = parse(value)?;
+        if let Some(p) = prev {
+            if p != len {
+                debug!("multiple Content-Length headers, differing values: {} vs {}", p, len);
+                return Err(InvalidContentLength);
+            }
+        } else {
+            prev = Some(len);
+        }
+    }
+    Ok(prev.expect("GetAll always has at least 1 value"))
+}
+
+fn find_chunked(value: &HeaderValue) -> bool {
+    value.to_str().map(|s| {
+        let last = s.rsplit(',')
+            .next()
+            .expect("split always has at least 1 item")
+            .trim();
+        ::unicase::eq_ascii(last, "chunked")
+    })
+        .unwrap_or(false)
+}
+
+#[derive(Copy, Clone, Debug)]
+struct InvalidContentLength;
 
 #[derive(Clone, Copy)]
 struct HeaderIndices {
@@ -342,7 +426,7 @@ struct HeadersAsBytesIter<'a> {
 }
 
 impl<'a> Iterator for HeadersAsBytesIter<'a> {
-    type Item = (&'a str, Bytes);
+    type Item = (HeaderName, HeaderValue);
     fn next(&mut self) -> Option<Self::Item> {
         self.headers.next().map(|header| {
             let name = unsafe {
@@ -350,9 +434,15 @@ impl<'a> Iterator for HeadersAsBytesIter<'a> {
                     self.slice.as_ref().as_ptr().offset(header.name.0 as isize),
                     header.name.1 - header.name.0
                 );
-                ::std::str::from_utf8_unchecked(bytes)
+                // TODO: use HeaderName::from_bytes_unchecked
+                HeaderName::from_bytes(bytes)
+                    .expect("httparse enforces valid header names")
             };
-            (name, self.slice.slice(header.value.0, header.value.1))
+            let bytes = self.slice.slice(header.value.0, header.value.1);
+            // TODO: use HeaderValue::from_shared_unchecked
+            let value = HeaderValue::from_shared(bytes)
+                .expect("httparse enforces valid header values");
+            (name, value)
         })
     }
 }
@@ -380,9 +470,12 @@ fn extend(dst: &mut Vec<u8>, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
+    use http::header::*;
+    use http::status;
+    use http::version::HTTP_11;
+    use http;
 
-    use http::{MessageHead, ServerTransaction, ClientTransaction, Http1Transaction};
-    use header::{ContentLength, TransferEncoding};
+    use proto::{ServerTransaction, ClientTransaction, Http1Transaction};
 
     #[test]
     fn test_parse_request() {
@@ -392,11 +485,11 @@ mod tests {
         let expected_len = raw.len();
         let (req, len) = ServerTransaction::parse(&mut raw).unwrap().unwrap();
         assert_eq!(len, expected_len);
-        assert_eq!(req.subject.0, ::Method::Get);
-        assert_eq!(req.subject.1, "/echo");
-        assert_eq!(req.version, ::HttpVersion::Http11);
+        assert_eq!(req.method, http::method::GET);
+        assert_eq!(req.uri, "/echo");
+        assert_eq!(req.version, HTTP_11);
         assert_eq!(req.headers.len(), 1);
-        assert_eq!(req.headers.get_raw("Host").map(|raw| &raw[0]), Some(b"hyper.rs".as_ref()));
+        assert_eq!(req.headers.get("Host").map(|v| v.as_bytes()), Some(b"hyper.rs".as_ref()));
     }
 
 
@@ -408,11 +501,10 @@ mod tests {
         let expected_len = raw.len();
         let (req, len) = ClientTransaction::parse(&mut raw).unwrap().unwrap();
         assert_eq!(len, expected_len);
-        assert_eq!(req.subject.0, 200);
-        assert_eq!(req.subject.1, "OK");
-        assert_eq!(req.version, ::HttpVersion::Http11);
+        assert_eq!(req.status.as_u16(), 200);
+        assert_eq!(req.version, HTTP_11);
         assert_eq!(req.headers.len(), 1);
-        assert_eq!(req.headers.get_raw("Content-Length").map(|raw| &raw[0]), Some(b"0".as_ref()));
+        assert_eq!(req.headers.get("Content-Length").map(|v| v.as_bytes()), Some(b"0".as_ref()));
     }
 
     #[test]
@@ -421,6 +513,7 @@ mod tests {
         ServerTransaction::parse(&mut raw).unwrap_err();
     }
 
+    /*
     #[test]
     fn test_parse_raw_status() {
         let mut raw = BytesMut::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
@@ -431,6 +524,7 @@ mod tests {
         let (res, _) = ClientTransaction::parse(&mut raw).unwrap().unwrap();
         assert_eq!(res.subject.1, "Howdy");
     }
+    */
 
 
     #[test]
@@ -438,34 +532,36 @@ mod tests {
         use super::Decoder;
 
         let method = &mut None;
-        let mut head = MessageHead::<::http::RequestLine>::default();
+        let mut head = http::Request::new(()).into_parts().0;
 
-        head.subject.0 = ::Method::Get;
+        head.method = http::method::GET;
         assert_eq!(Decoder::length(0), ServerTransaction::decoder(&head, method).unwrap());
-        assert_eq!(*method, Some(::Method::Get));
+        assert_eq!(*method, Some(http::method::GET));
 
-        head.subject.0 = ::Method::Post;
+        head.method = http::method::POST;
         assert_eq!(Decoder::length(0), ServerTransaction::decoder(&head, method).unwrap());
-        assert_eq!(*method, Some(::Method::Post));
+        assert_eq!(*method, Some(http::method::POST));
 
-        head.headers.set(TransferEncoding::chunked());
+        head.headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
         assert_eq!(Decoder::chunked(), ServerTransaction::decoder(&head, method).unwrap());
         // transfer-encoding and content-length = chunked
-        head.headers.set(ContentLength(10));
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
         assert_eq!(Decoder::chunked(), ServerTransaction::decoder(&head, method).unwrap());
 
-        head.headers.remove::<TransferEncoding>();
+        head.headers.remove(&TRANSFER_ENCODING);
         assert_eq!(Decoder::length(10), ServerTransaction::decoder(&head, method).unwrap());
 
-        head.headers.set_raw("Content-Length", vec![b"5".to_vec(), b"5".to_vec()]);
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        head.headers.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
         assert_eq!(Decoder::length(5), ServerTransaction::decoder(&head, method).unwrap());
 
-        head.headers.set_raw("Content-Length", vec![b"10".to_vec(), b"11".to_vec()]);
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
+        head.headers.append(CONTENT_LENGTH, HeaderValue::from_static("11"));
         ServerTransaction::decoder(&head, method).unwrap_err();
 
-        head.headers.remove::<ContentLength>();
+        head.headers.remove(&CONTENT_LENGTH);
 
-        head.headers.set_raw("Transfer-Encoding", "gzip");
+        head.headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("notchunked"));
         ServerTransaction::decoder(&head, method).unwrap_err();
     }
 
@@ -473,46 +569,48 @@ mod tests {
     fn test_decoder_response() {
         use super::Decoder;
 
-        let method = &mut Some(::Method::Get);
-        let mut head = MessageHead::<::http::RawStatus>::default();
+        let method = &mut Some(http::method::GET);
+        let mut head = ::http::Response::new(()).into_parts().0;
 
-        head.subject.0 = 204;
+        head.status = status::NO_CONTENT;
         assert_eq!(Decoder::length(0), ClientTransaction::decoder(&head, method).unwrap());
-        head.subject.0 = 304;
+        head.status = status::NOT_MODIFIED;
         assert_eq!(Decoder::length(0), ClientTransaction::decoder(&head, method).unwrap());
 
-        head.subject.0 = 200;
+        head.status = status::OK;
         assert_eq!(Decoder::eof(), ClientTransaction::decoder(&head, method).unwrap());
 
-        *method = Some(::Method::Head);
+        *method = Some(http::method::HEAD);
         assert_eq!(Decoder::length(0), ClientTransaction::decoder(&head, method).unwrap());
 
-        *method = Some(::Method::Connect);
+        *method = Some(http::method::CONNECT);
         assert_eq!(Decoder::length(0), ClientTransaction::decoder(&head, method).unwrap());
 
 
         // CONNECT receiving non 200 can have a body
-        head.subject.0 = 404;
-        head.headers.set(ContentLength(10));
+        head.status = status::NOT_FOUND;
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
         assert_eq!(Decoder::length(10), ClientTransaction::decoder(&head, method).unwrap());
-        head.headers.remove::<ContentLength>();
+        head.headers.remove(&CONTENT_LENGTH);
 
 
-        *method = Some(::Method::Get);
-        head.headers.set(TransferEncoding::chunked());
+        *method = Some(http::method::GET);
+        head.headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
         assert_eq!(Decoder::chunked(), ClientTransaction::decoder(&head, method).unwrap());
 
         // transfer-encoding and content-length = chunked
-        head.headers.set(ContentLength(10));
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
         assert_eq!(Decoder::chunked(), ClientTransaction::decoder(&head, method).unwrap());
 
-        head.headers.remove::<TransferEncoding>();
+        head.headers.remove(&TRANSFER_ENCODING);
         assert_eq!(Decoder::length(10), ClientTransaction::decoder(&head, method).unwrap());
 
-        head.headers.set_raw("Content-Length", vec![b"5".to_vec(), b"5".to_vec()]);
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        head.headers.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
         assert_eq!(Decoder::length(5), ClientTransaction::decoder(&head, method).unwrap());
 
-        head.headers.set_raw("Content-Length", vec![b"10".to_vec(), b"11".to_vec()]);
+        head.headers.insert(CONTENT_LENGTH, HeaderValue::from_static("10"));
+        head.headers.append(CONTENT_LENGTH, HeaderValue::from_static("11"));
         ClientTransaction::decoder(&head, method).unwrap_err();
     }
 
@@ -558,6 +656,7 @@ mod tests {
         }
     }
 
+    /*
     #[cfg(feature = "nightly")]
     #[bench]
     fn bench_server_transaction_encode(b: &mut Bencher) {
@@ -567,7 +666,7 @@ mod tests {
         let len = 108;
         b.bytes = len as u64;
 
-        let mut head = MessageHead {
+        let mut head = Parts {
             subject: StatusCode::Ok,
             headers: Headers::new(),
             version: HttpVersion::Http11,
@@ -582,4 +681,5 @@ mod tests {
             ::test::black_box(vec);
         })
     }
+    */
 }

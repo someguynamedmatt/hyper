@@ -1,4 +1,4 @@
-use method::Method;
+use ::Method;
 
 header! {
     /// `Allow` header, defined in [RFC7231](http://tools.ietf.org/html/rfc7231#section-7.4.1)

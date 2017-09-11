@@ -1,4 +1,4 @@
-use method::Method;
+use ::Method;
 
 header! {
     /// `Access-Control-Request-Method` header, part of

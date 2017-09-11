@@ -1,4 +1,4 @@
-use method::Method;
+use ::Method;
 
 header! {
     /// `Access-Control-Allow-Methods` header, part of
