@@ -10,6 +10,9 @@ use futures::{Future, Async, Poll};
 use relay;
 
 use proto::{KeepAlive, KA};
+use super::Ver;
+
+pub(super) type Key = (Rc<String>, Ver);
 
 pub struct Pool<T> {
     inner: Rc<RefCell<PoolInner<T>>>,
@@ -25,10 +28,12 @@ pub trait Ready {
 }
 
 struct PoolInner<T> {
+    #[cfg(feature = "http2")]
+    connecting: HashMap<Key, ()>,
     enabled: bool,
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
-    idle: HashMap<Rc<String>, Vec<Entry<T>>>,
+    idle: HashMap<Key, Vec<Entry<T>>>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -38,7 +43,7 @@ struct PoolInner<T> {
     // this list is checked for any parked Checkouts, and tries to notify
     // them that the Conn could be used instead of waiting for a brand new
     // connection.
-    parked: HashMap<Rc<String>, VecDeque<relay::Sender<Entry<T>>>>,
+    parked: HashMap<Key, VecDeque<(relay::Sender<Entry<T>>, CancelToken)>>,
     timeout: Option<Duration>,
 }
 
@@ -46,6 +51,8 @@ impl<T: Clone> Pool<T> {
     pub fn new(enabled: bool, timeout: Option<Duration>) -> Pool<T> {
         Pool {
             inner: Rc::new(RefCell::new(PoolInner {
+                #[cfg(feature = "http2")]
+                connecting: HashMap::new(),
                 enabled: enabled,
                 idle: HashMap::new(),
                 parked: HashMap::new(),
@@ -54,27 +61,45 @@ impl<T: Clone> Pool<T> {
         }
     }
 
-    pub fn checkout(&self, key: &str) -> Checkout<T> {
+    pub(super) fn checkout(&self, key: &str, ver: Ver) -> Checkout<T> {
         Checkout {
-            key: Rc::new(key.to_owned()),
+            cancel_token: CancelToken(Rc::new(Cell::new(false))),
+            key: (Rc::new(key.to_owned()), ver),
             pool: self.clone(),
             parked: None,
         }
     }
 
-    fn put(&mut self, key: Rc<String>, entry: Entry<T>) {
+    #[cfg(feature = "http2")]
+    pub(super) fn connecting(&self, key: Key) {
+        if key.1 != Ver::Http1 {
+            self.inner.borrow_mut().connecting.insert(key, ());
+        }
+    }
+
+    #[cfg(feature = "http2")]
+    pub(super) fn is_connecting(&self, key: &Key) -> bool {
+        key.1 != Ver::Http1
+            && self.inner.borrow().connecting.contains_key(key)
+    }
+
+    fn put(&self, key: Key, entry: Entry<T>) {
         trace!("Pool::put {:?}", key);
         let mut inner = self.inner.borrow_mut();
         //let inner = &mut *inner;
         let mut remove_parked = false;
         let mut entry = Some(entry);
         if let Some(parked) = inner.parked.get_mut(&key) {
-            while let Some(tx) = parked.pop_front() {
-                if tx.is_canceled() {
+            while let Some((tx, token)) = parked.pop_front() {
+                if tx.is_canceled() || token.is_canceled() {
                     trace!("Pool::put removing canceled parked {:?}", key);
                 } else {
-                    tx.complete(entry.take().unwrap());
-                    break;
+                    if key.1 == Ver::Http1 {
+                        tx.complete(entry.take().unwrap());
+                        break;
+                    } else {
+                        tx.complete(entry.clone().take().unwrap());
+                    }
                 }
                 /*
                 match tx.send(entry.take().unwrap()) {
@@ -104,8 +129,8 @@ impl<T: Clone> Pool<T> {
     }
 
 
-    pub fn pooled(&self, key: Rc<String>, value: T) -> Pooled<T> {
-        Pooled {
+    pub(super) fn pooled(&self, key: Key, value: T) -> Pooled<T> {
+        let pooled = Pooled {
             entry: Entry {
                 value: value,
                 is_reused: false,
@@ -113,14 +138,18 @@ impl<T: Clone> Pool<T> {
             },
             key: key,
             pool: Rc::downgrade(&self.inner),
+        };
+        if pooled.key.1 != Ver::Http1 {
+            self.put(pooled.key.clone(), pooled.entry.clone());
         }
+        pooled
     }
 
     fn is_enabled(&self) -> bool {
         self.inner.borrow().enabled
     }
 
-    fn reuse(&self, key: Rc<String>, mut entry: Entry<T>) -> Pooled<T> {
+    fn reuse(&self, key: Key, mut entry: Entry<T>) -> Pooled<T> {
         trace!("reuse {:?}", key);
         entry.is_reused = true;
         entry.status.set(TimedKA::Busy);
@@ -131,24 +160,24 @@ impl<T: Clone> Pool<T> {
         }
     }
 
-    fn park(&mut self, key: Rc<String>, tx: relay::Sender<Entry<T>>) {
+    fn park(&mut self, key: Key, tx: relay::Sender<Entry<T>>, token: CancelToken) {
         trace!("park; waiting for idle connection: {:?}", key);
         self.inner.borrow_mut()
             .parked.entry(key)
             .or_insert(VecDeque::new())
-            .push_back(tx);
+            .push_back((tx, token));
     }
 }
 
 impl<T> Pool<T> {
-    fn clean_parked(&mut self, key: &Rc<String>) {
+    fn clean_parked(&mut self, key: &Key) {
         trace!("clean_parked {:?}", key);
         let mut inner = self.inner.borrow_mut();
 
         let mut remove_parked = false;
         if let Some(parked) = inner.parked.get_mut(key) {
-            parked.retain(|tx| {
-                !tx.is_canceled()
+            parked.retain(|&(ref tx, ref token)| {
+                !tx.is_canceled() && !token.is_canceled()
             });
             remove_parked = parked.is_empty();
         }
@@ -169,7 +198,7 @@ impl<T> Clone for Pool<T> {
 #[derive(Clone)]
 pub struct Pooled<T> {
     entry: Entry<T>,
-    key: Rc<String>,
+    key: Key,
     pool: Weak<RefCell<PoolInner<T>>>,
 }
 
@@ -260,9 +289,23 @@ enum TimedKA {
 }
 
 pub struct Checkout<T> {
-    key: Rc<String>,
+    cancel_token: CancelToken,
+    key: Key,
     pool: Pool<T>,
     parked: Option<relay::Receiver<Entry<T>>>,
+}
+
+#[derive(Clone)]
+pub struct CancelToken(Rc<Cell<bool>>);
+
+impl<T> Checkout<T> {
+    pub(super) fn key(&self) -> &Key {
+        &self.key
+    }
+
+    pub(super) fn cancel_token(&self) -> &CancelToken {
+        &self.cancel_token
+    }
 }
 
 impl<T: Ready + Clone> Future for Checkout<T> {
@@ -272,7 +315,9 @@ impl<T: Ready + Clone> Future for Checkout<T> {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         trace!("Checkout::poll");
         let mut drop_parked = false;
-        if let Some(ref mut rx) = self.parked {
+        if self.cancel_token.is_canceled() {
+            drop_parked = true;
+        } else if let Some(ref mut rx) = self.parked {
             match rx.poll() {
                 Ok(Async::Ready(entry)) => {
                     trace!("Checkout::poll found client in relay for {:?}", self.key);
@@ -296,6 +341,9 @@ impl<T: Ready + Clone> Future for Checkout<T> {
                     TimedKA::Idle(idle_at) if !expiration.expires(idle_at) => {
                         if let Ok(Async::Ready(())) = entry.value.poll_ready() {
                             debug!("found idle connection for {:?}", key);
+                            if key.1 != Ver::Http1 {
+                                list.push(entry.clone());
+                            }
                             should_remove = list.is_empty();
                             return Some(entry);
                         }
@@ -318,10 +366,10 @@ impl<T: Ready + Clone> Future for Checkout<T> {
         match entry {
             Some(entry) => Ok(Async::Ready(self.pool.reuse(self.key.clone(), entry))),
             None => {
-                if self.parked.is_none() {
+                if self.parked.is_none() && !self.cancel_token.is_canceled() {
                     let (tx, mut rx) = relay::channel();
                     let _ = rx.poll(); // park this task
-                    self.pool.park(self.key.clone(), tx);
+                    self.pool.park(self.key.clone(), tx, self.cancel_token.clone());
                     self.parked = Some(rx);
                 }
                 Ok(Async::NotReady)
@@ -334,6 +382,16 @@ impl<T> Drop for Checkout<T> {
     fn drop(&mut self) {
         self.parked.take();
         self.pool.clean_parked(&self.key);
+    }
+}
+
+impl CancelToken {
+    pub fn cancel(&self) {
+        self.0.set(true);
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.0.get()
     }
 }
 

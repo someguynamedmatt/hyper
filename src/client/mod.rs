@@ -16,7 +16,6 @@ pub use tokio_service::Service;
 
 use header::{Host};
 use proto;
-use proto::request;
 use method::Method;
 use self::pool::Pool;
 use uri::{self, Uri};
@@ -148,6 +147,7 @@ impl Future for FutureResponse {
     }
 }
 
+
 impl<C, B> Service for Client<C, B>
 where C: Connect,
       B: Stream<Error=::Error> + 'static,
@@ -158,15 +158,13 @@ where C: Connect,
     type Error = ::Error;
     type Future = FutureResponse;
 
-    fn call(&self, req: Self::Request) -> Self::Future {
-        match req.version() {
-            HttpVersion::Http10 |
-            HttpVersion::Http11 => (),
-            other => {
-                error!("Request has unsupported version \"{}\"", other);
-                return FutureResponse(Box::new(future::err(::Error::Version)));
-            }
-        }
+    fn call(&self, mut req: Self::Request) -> Self::Future {
+        let ver = match check_version(req.version()) {
+            Ok(ver) => ver,
+            Err(e) => return FutureResponse(Box::new(future::err(e))),
+        };
+
+        let is_h2 = ver != Ver::Http1;
 
         let url = req.uri().clone();
         let domain = match uri::scheme_and_authority(&url) {
@@ -180,25 +178,29 @@ where C: Connect,
                 ))));
             }
         };
-        let (mut head, body) = request::split(req);
-        if !head.headers.has::<Host>() {
+
+        if !req.headers().has::<Host>() {
             let host = Host::new(
                 domain.host().expect("authority implies host").to_owned(),
                 domain.port(),
             );
-            head.headers.set_pos(0, host);
+            req.headers_mut().set_pos(0, host);
         }
 
         use futures::Sink;
         use futures::sync::{mpsc, oneshot};
 
-        let checkout = self.pool.checkout(domain.as_ref());
+
+        let checkout = self.pool.checkout(domain.as_ref(), ver);
         let connect = {
             let executor = self.executor.clone();
             let pool = self.pool.clone();
-            let pool_key = Rc::new(domain.to_string());
-            self.connector.connect(url)
+            let pool_key = checkout.key().clone();
+            let checkout_cancel = checkout.cancel_token().clone();
+
+            let connect = self.connector.connect(url)
                 .and_then(move |io| {
+                    checkout_cancel.cancel();
                     // 1 extra slot for possible Close message
                     let (tx, rx) = mpsc::channel(1);
                     let tx = HyperClient {
@@ -206,11 +208,38 @@ where C: Connect,
                         should_close: Cell::new(true),
                     };
                     let pooled = pool.pooled(pool_key, tx);
-                    let conn = proto::Conn::<_, _, proto::ClientTransaction, _>::new(io, pooled.clone());
-                    let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Client::new(rx), conn);
-                    executor.execute(dispatch.map_err(|e| debug!("client connection error: {}", e)))?;
+                    if is_h2 {
+                        #[cfg(feature = "http2")]
+                        {
+                            let dispatch = proto::h2::Client::new(io, rx, executor.clone());
+                            executor.execute(dispatch.map_err(|e| debug!("client connection error: {}", e)))?;
+                        }
+                    } else {
+                        let conn = proto::Conn::<_, _, proto::ClientTransaction, _>::new(io, pooled.clone());
+                        let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Client::new(rx), conn);
+                        executor.execute(dispatch.map_err(|e| debug!("client connection error: {}", e)))?;
+                    }
                     Ok(pooled)
+                });
+
+            #[cfg(feature = "http2")]
+            {
+                // before polling on the connect future, check if the pool
+                // already has one (if this is HTTP2)
+                let pool = self.pool.clone();
+                let pool_key = checkout.key().clone();
+                future::lazy(move || {
+                    if pool.is_connecting(&pool_key) {
+                        trace!("pool found existing connecting task for {:?}", pool_key);
+                        future::Either::A(future::empty())
+                    } else {
+                        pool.connecting(pool_key);
+                        future::Either::B(connect)
+                    }
                 })
+            }
+            #[cfg(not(feature = "http2"))]
+            connect
         };
 
         let race = checkout.select(connect)
@@ -230,10 +259,10 @@ where C: Connect,
             let (callback, rx) = oneshot::channel();
             client.should_close.set(false);
 
-            match client.tx.borrow_mut().start_send(ClientMsg::Request(head, body, callback)) {
+            match client.tx.borrow_mut().start_send(ClientMsg::Request(req, callback)) {
                 Ok(_) => (),
                 Err(e) => match e.into_inner() {
-                    ClientMsg::Request(_, _, callback) => {
+                    ClientMsg::Request(_, callback) => {
                         error!("pooled connection was not ready, this is a hyper bug");
                         let err = io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -244,6 +273,7 @@ where C: Connect,
                     _ => unreachable!("ClientMsg::Request was just sent"),
                 }
             }
+
 
             rx.then(|res| {
                 match res {
@@ -257,6 +287,45 @@ where C: Connect,
         FutureResponse(Box::new(resp))
     }
 
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Ver {
+    Http1,
+    #[cfg_attr(not(feature = "http2"), allow(unused))]
+    Http2,
+}
+
+#[cfg(not(feature = "http2"))]
+fn check_version(version: HttpVersion) -> ::Result<Ver> {
+    match version {
+        HttpVersion::Http10 |
+        HttpVersion::Http11 => {
+            Ok(Ver::Http1)
+        },
+        other => {
+            error!("Request has unsupported version \"{}\"", other);
+            Err(::Error::Version)
+        }
+    }
+}
+
+#[cfg(feature = "http2")]
+fn check_version(version: HttpVersion) -> ::Result<Ver> {
+    match version {
+        HttpVersion::Http10 |
+        HttpVersion::Http11 => {
+            Ok(Ver::Http1)
+        },
+        HttpVersion::Http2 => {
+            Ok(Ver::Http2)
+        },
+        other => {
+            error!("Request has unsupported version \"{}\"", other);
+            Err(::Error::Version)
+        }
+    }
 }
 
 impl<C: Clone, B> Clone for Client<C, B> {
@@ -474,14 +543,14 @@ impl<C: Clone, B> Clone for Config<C, B> {
 // ===== impl Exec =====
 
 #[derive(Clone)]
-enum Exec {
+pub(crate) enum Exec {
     Handle(Handle),
     Executor(Rc<Executor<Background>>),
 }
 
 
 impl Exec {
-    fn execute<F>(&self, fut: F) -> io::Result<()>
+    pub fn execute<F>(&self, fut: F) -> io::Result<()>
     where
         F: Future<Item=(), Error=()> + 'static,
     {

@@ -1,13 +1,43 @@
 use std::fmt;
-//use std::mem;
 
 use bytes::Bytes;
+#[cfg(feature = "h2")]
+use h2::ReleaseCapacity;
 
 /// A piece of a message body.
 pub struct Chunk(Inner);
 
-enum Inner {
-    Shared(Bytes),
+struct Inner {
+    bytes: Bytes,
+    #[cfg(feature = "h2")]
+    _flow_control: Option<AutoRelease>,
+}
+
+#[cfg(feature = "h2")]
+struct AutoRelease {
+    cap: usize,
+    release: ReleaseCapacity,
+}
+
+#[cfg(feature = "h2")]
+impl Drop for AutoRelease {
+    fn drop(&mut self) {
+        let _ = self.release.release_capacity(self.cap);
+    }
+}
+
+impl Chunk {
+    #[cfg(feature = "h2")]
+    pub(super) fn h2(bytes: Bytes, rel_cap: &ReleaseCapacity) -> Chunk {
+        let cap = bytes.len();
+        Chunk(Inner {
+            bytes: bytes,
+            _flow_control: Some(AutoRelease {
+                cap: cap,
+                release: rel_cap.clone(),
+            }),
+        })
+    }
 }
 
 impl From<Vec<u8>> for Chunk {
@@ -40,17 +70,19 @@ impl From<&'static str> for Chunk {
 
 impl From<Bytes> for Chunk {
     #[inline]
-    fn from(mem: Bytes) -> Chunk {
-        Chunk(Inner::Shared(mem))
+    fn from(bytes: Bytes) -> Chunk {
+        Chunk(Inner {
+            bytes: bytes,
+            #[cfg(feature = "h2")]
+            _flow_control: None,
+        })
     }
 }
 
 impl From<Chunk> for Bytes {
     #[inline]
     fn from(chunk: Chunk) -> Bytes {
-        match chunk.0 {
-            Inner::Shared(bytes) => bytes,
-        }
+        chunk.0.bytes
     }
 }
 
@@ -66,9 +98,7 @@ impl ::std::ops::Deref for Chunk {
 impl AsRef<[u8]> for Chunk {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        match self.0 {
-            Inner::Shared(ref slice) => slice,
-        }
+        &self.0.bytes
     }
 }
 
@@ -82,7 +112,11 @@ impl fmt::Debug for Chunk {
 impl Default for Chunk {
     #[inline]
     fn default() -> Chunk {
-        Chunk(Inner::Shared(Bytes::new()))
+        Chunk(Inner {
+            bytes: Bytes::new(),
+            #[cfg(feature = "h2")]
+            _flow_control: None,
+        })
     }
 }
 
@@ -92,17 +126,13 @@ impl IntoIterator for Chunk {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        match self.0 {
-            Inner::Shared(bytes) => bytes.into_iter(),
-        }
+        self.0.bytes.into_iter()
     }
 }
 
 impl Extend<u8> for Chunk {
     #[inline]
     fn extend<T>(&mut self, iter: T) where T: IntoIterator<Item=u8> {
-        match self.0 {
-            Inner::Shared(ref mut bytes) => bytes.extend(iter)
-        }
+        self.0.bytes.extend(iter)
     }
 }

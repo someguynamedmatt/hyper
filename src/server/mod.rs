@@ -56,6 +56,7 @@ pub struct Http<B = ::Chunk> {
     max_buf_size: Option<usize>,
     keep_alive: bool,
     pipeline: bool,
+    version: Version,
     _marker: PhantomData<B>,
 }
 
@@ -120,8 +121,21 @@ pub struct Connection<I, S>
 where
     S: HyperService,
     S::ResponseBody: Stream<Error=::Error>,
-    <S::ResponseBody as Stream>::Item: AsRef<[u8]>,
+    <S::ResponseBody as Stream>::Item: AsRef<[u8]> + 'static,
 {
+    #[cfg(feature = "http2")]
+    conn: future::Either<
+        proto::dispatch::Dispatcher<
+            proto::dispatch::Server<S>,
+            S::ResponseBody,
+            I,
+            <S::ResponseBody as Stream>::Item,
+            proto::ServerTransaction,
+            proto::KA,
+        >,
+        proto::h2::Server<I, S, S::ResponseBody>,
+    >,
+    #[cfg(not(feature = "http2"))]
     conn: proto::dispatch::Dispatcher<
         proto::dispatch::Server<S>,
         S::ResponseBody,
@@ -130,6 +144,14 @@ where
         proto::ServerTransaction,
         proto::KA,
     >,
+}
+
+// The preference for the protocol of the underlying server dispatcher.
+#[derive(Clone, Copy, Debug)]
+enum Version {
+    Http1,
+    #[cfg(feature = "http2")]
+    Http2,
 }
 
 // ===== impl Http =====
@@ -142,8 +164,16 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
             keep_alive: true,
             max_buf_size: None,
             pipeline: false,
+            version: Version::Http1,
             _marker: PhantomData,
         }
+    }
+
+    /// Require that HTTP/2 Prior Knowledge to be used.
+    #[cfg(feature = "http2")]
+    pub fn http2(&mut self) -> &mut Self {
+        self.version = Version::Http2;
+        self
     }
 
     /// Enables or disables HTTP keep-alive.
@@ -246,6 +276,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
                 keep_alive: self.keep_alive,
                 max_buf_size: self.max_buf_size,
                 pipeline: self.pipeline,
+                version: self.version,
                 _marker: PhantomData,
             },
         }
@@ -256,24 +287,42 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
     /// This returns a Future that must be polled in order for HTTP to be
     /// driven on the connection.
     pub fn serve_connection<S, I, Bd>(&self, io: I, service: S) -> Connection<I, S>
-        where S: Service<Request = Request, Response = Response<Bd>, Error = ::Error>,
+        where S: Service<Request = Request, Response = Response<Bd>, Error = ::Error> + 'static,
               Bd: Stream<Error=::Error>,
               Bd::Item: AsRef<[u8]>,
-              I: AsyncRead + AsyncWrite,
+              I: AsyncRead + AsyncWrite + 'static,
 
     {
-        let ka = if self.keep_alive {
-            proto::KA::Busy
-        } else {
-            proto::KA::Disabled
+        let inner = match self.version {
+            Version::Http1 => {
+                let ka = if self.keep_alive {
+                    proto::KA::Busy
+                } else {
+                    proto::KA::Disabled
+                };
+                let mut conn = proto::Conn::new(io, ka);
+                conn.set_flush_pipeline(self.pipeline);
+                if let Some(max) = self.max_buf_size {
+                    conn.set_max_buf_size(max);
+                }
+                let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Server::new(service), conn);
+
+                #[cfg(feature = "http2")]
+                {
+                    future::Either::A(dispatch)
+                }
+                #[cfg(not(feature = "http2"))]
+                {
+                    dispatch
+                }
+            },
+            #[cfg(feature = "http2")]
+            Version::Http2 => {
+                future::Either::B(::proto::h2::server(io, service))
+            },
         };
-        let mut conn = proto::Conn::new(io, ka);
-        conn.set_flush_pipeline(self.pipeline);
-        if let Some(max) = self.max_buf_size {
-            conn.set_max_buf_size(max);
-        }
         Connection {
-            conn: proto::dispatch::Dispatcher::new(proto::dispatch::Server::new(service), conn),
+            conn: inner,
         }
     }
 }
@@ -293,6 +342,7 @@ impl<B> fmt::Debug for Http<B> {
         f.debug_struct("Http")
             .field("keep_alive", &self.keep_alive)
             .field("pipeline", &self.pipeline)
+            .field("version", &self.version)
             .finish()
     }
 }
@@ -453,10 +503,11 @@ impl<I, S> Serve<I, S> {
 impl<I, S, B> Stream for Serve<I, S>
 where
     I: Stream<Error=io::Error>,
-    I::Item: AsyncRead + AsyncWrite,
+    I::Item: AsyncRead + AsyncWrite + 'static,
     S: NewService<Request=Request, Response=Response<B>, Error=::Error>,
+    S::Instance: 'static,
     B: Stream<Error=::Error>,
-    B::Item: AsRef<[u8]>,
+    B::Item: AsRef<[u8]> + 'static,
 {
     type Item = Connection<I::Item, S::Instance>;
     type Error = ::Error;
@@ -550,7 +601,15 @@ where S: Service<Request = Request, Response = Response<B>, Error = ::Error> + '
 {
     /// Disables keep-alive for this connection.
     pub fn disable_keep_alive(&mut self) {
-        self.conn.disable_keep_alive()
+        #[cfg(feature = "http2")]
+        match self.conn {
+            future::Either::A(ref mut h1) => h1.disable_keep_alive(),
+            future::Either::B(_) => debug!("disable_keep_alive not implemented for HTTP/2"),
+        }
+        #[cfg(not(feature = "http2"))]
+        {
+            self.conn.disable_keep_alive()
+        }
     }
 }
 

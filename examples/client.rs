@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use futures::Future;
 use futures::stream::Stream;
 
-use hyper::Client;
+use hyper::{Client, HttpVersion, Request};
 
 fn main() {
     pretty_env_logger::init();
@@ -34,16 +34,35 @@ fn main() {
     let handle = core.handle();
     let client = Client::new(&handle);
 
-    let work = client.get(url).and_then(|res| {
-        println!("Response: {}", res.status());
+    let mut req = Request::new(::hyper::Get, url.clone());
+    req.set_version(HttpVersion::Http2);
+
+    let work1 = client.request(req).and_then(|res| {
+        println!("Version: {}", res.version());
+        println!("Status: {}", res.status());
         println!("Headers: \n{}", res.headers());
 
         res.body().for_each(|chunk| {
             io::stdout().write_all(&chunk).map_err(From::from)
         })
     }).map(|_| {
-        println!("\n\nDone.");
+        println!("\n\nDone 1.");
     });
 
-    core.run(work).unwrap();
+    let mut req = Request::new(::hyper::Get, url);
+    req.set_version(HttpVersion::Http2);
+
+    let work2 = client.request(req).and_then(|res| {
+        println!("Version: {}", res.version());
+        println!("Status: {}", res.status());
+        println!("Headers: \n{}", res.headers());
+
+        res.body().for_each(|chunk| {
+            io::stdout().write_all(&chunk).map_err(From::from)
+        })
+    }).map(|_| {
+        println!("\n\nDone 2.");
+    });
+
+    core.run(work1.join(work2)).unwrap();
 }

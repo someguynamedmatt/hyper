@@ -37,7 +37,7 @@ pub struct Client<B> {
 }
 
 pub enum ClientMsg<B> {
-    Request(RequestHead, Option<B>, oneshot::Sender<::Result<::Response>>),
+    Request(::Request<B>, oneshot::Sender<::Result<::Response>>),
     Close,
 }
 
@@ -365,7 +365,8 @@ where
 
     fn poll_msg(&mut self) -> Poll<Option<(Self::PollItem, Option<Self::PollBody>)>, ::Error> {
         match self.rx.poll() {
-            Ok(Async::Ready(Some(ClientMsg::Request(head, body, mut cb)))) => {
+            Ok(Async::Ready(Some(ClientMsg::Request(req, mut cb)))) => {
+                let (head, body) = ::proto::request::split(req);
                 // check that future hasn't been canceled already
                 match cb.poll_cancel().expect("poll_cancel cannot error") {
                     Async::Ready(()) => {
@@ -404,7 +405,7 @@ where
                 if let Some(cb) = self.callback.take() {
                     let _ = cb.send(Err(err));
                     Ok(())
-                } else if let Ok(Async::Ready(Some(ClientMsg::Request(_, _, cb)))) = self.rx.poll() {
+                } else if let Ok(Async::Ready(Some(ClientMsg::Request(_, cb)))) = self.rx.poll() {
                     let _ = cb.send(Err(err));
                     Ok(())
                 } else {
@@ -451,13 +452,9 @@ mod tests {
             let conn = Conn::<_, ::Chunk, ClientTransaction>::new(io, Default::default());
             let mut dispatcher = Dispatcher::new(Client::new(rx), conn);
 
-            let req = RequestHead {
-                version: ::HttpVersion::Http11,
-                subject: ::proto::RequestLine::default(),
-                headers: Default::default(),
-            };
+            let req = Request::new();
             let (res_tx, res_rx) = oneshot::channel();
-            tx.start_send(ClientMsg::Request(req, None::<::Body>, res_tx)).unwrap();
+            tx.start_send(ClientMsg::Request(req, res_tx)).unwrap();
 
             dispatcher.poll().expect("dispatcher poll 1");
             dispatcher.poll().expect("dispatcher poll 2");

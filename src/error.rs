@@ -6,6 +6,8 @@ use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 
 use httparse;
+#[cfg(feature = "http2")]
+use h2;
 
 pub use uri::UriError;
 
@@ -47,6 +49,9 @@ pub enum Error {
     Timeout,
     /// A protocol upgrade was encountered, but not yet supported in hyper.
     Upgrade,
+    /// An HTTP/2 error.
+    #[cfg(feature = "http2")]
+    Http2(Http2),
     /// An `io::Error` that occurred while trying to read or write to a network stream.
     Io(IoError),
     /// Parsing a field as string failed
@@ -54,6 +59,28 @@ pub enum Error {
 
     #[doc(hidden)]
     __Nonexhaustive(Void)
+}
+
+// Wraps an `h2::Error`. For now, this just a mostly opaque type, as we explore
+// adding h2 into hyper. It can be printed for debugging purposes.
+#[doc(hidden)]
+#[cfg(feature = "http2")]
+pub struct Http2 {
+    inner: h2::Error,
+}
+
+#[cfg(feature = "http2")]
+impl fmt::Debug for Http2 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+#[cfg(feature = "http2")]
+impl fmt::Display for Http2 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, f)
+    }
 }
 
 #[doc(hidden)]
@@ -87,6 +114,8 @@ impl StdError for Error {
             Incomplete => "message is incomplete",
             Timeout => "timeout",
             Upgrade => "unsupported protocol upgrade",
+            #[cfg(feature = "http2")]
+            Error::Http2(ref e) => e.inner.description(),
             Uri(ref e) => e.description(),
             Io(ref e) => e.description(),
             Utf8(ref e) => e.description(),
@@ -140,6 +169,16 @@ impl From<httparse::Error> for Error {
             httparse::Error::TooManyHeaders => TooLarge,
             httparse::Error::Version => Version,
         }
+    }
+}
+
+
+#[cfg(feature = "http2")]
+impl From<h2::Error> for Error {
+    fn from(err: h2::Error) -> Error {
+        Error::Http2(Http2 {
+            inner: err,
+        })
     }
 }
 
