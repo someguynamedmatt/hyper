@@ -318,7 +318,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
             },
             #[cfg(feature = "http2")]
             Version::Http2 => {
-                future::Either::B(::proto::h2::server(io, service))
+                future::Either::B(::proto::h2::Server::new(io, service))
             },
         };
         Connection {

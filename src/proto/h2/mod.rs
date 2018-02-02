@@ -1,16 +1,16 @@
 use bytes::Buf;
 use futures::{Async, Future, Poll, Stream};
-use h2::SendStream;
+use h2::{Reason, SendStream};
 
 use ::proto::h1::Cursor;
 
 mod client;
-mod dispatch;
 mod server;
 
-pub(crate) use self::dispatch::{server};
 pub use self::client::Client;
 pub use self::server::Server;
+
+// body adpaters used by both Client and Server
 
 struct PipeToSendStream<S>
 where
@@ -45,11 +45,19 @@ where
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             //TODO: make use of flow control on SendStream
-            if let Some(chunk) = try_ready!(self.stream.poll()) {
-                self.body_tx.send_data(SendBuf(Some(Cursor::new(chunk))), false)?;
-            } else {
-                self.body_tx.send_data(SendBuf(None), true)?;
-                return Ok(Async::Ready(()));
+            match self.stream.poll() {
+                Ok(Async::Ready(Some(chunk))) => {
+                    self.body_tx.send_data(SendBuf(Some(Cursor::new(chunk))), false)?;
+                },
+                Ok(Async::Ready(None)) => {
+                    self.body_tx.send_data(SendBuf(None), true)?;
+                    return Ok(Async::Ready(()));
+                },
+                Ok(Async::NotReady) => return Ok(Async::NotReady),
+                Err(err) => {
+                    self.body_tx.send_reset(Reason::INTERNAL_ERROR);
+                    return Err(err);
+                }
             }
         }
     }
